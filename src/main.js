@@ -3,6 +3,9 @@ const landingMsg = document.getElementById('landing-msg');
 const wheel = document.getElementById('wheel');
 const readout = document.getElementById('readout');
 const connectBtn = document.getElementById('connect');
+const calToggle = document.getElementById('cal-toggle');
+const calPicker = document.getElementById('cal-picker');
+const calList = document.getElementById('cal-list');
 
 // OAuth client ID for live Google Calendar sync (client IDs are public
 // identifiers, safe to commit). Empty string disables the Connect button and
@@ -72,7 +75,7 @@ fetch('./rotary-calendar.svg')
     calendarSvg = svg;
     // Instant dial from the last sync; a background refresh may redraw it.
     const cache = readCachedEvents();
-    if (cache) drawEvents(svg, cache.events);
+    if (cache) setCalendarData(cache.calendars, cache.events);
   })
   .catch(() => {});
 
@@ -88,6 +91,7 @@ const CONNECTED_KEY = 'gcalConnected';
 const TOKEN_KEY = 'gcalToken';
 const HINT_KEY = 'gcalHint';
 const EVENTS_KEY = 'gcalEvents';
+const HIDDEN_KEY = 'gcalHidden';
 // Cache younger than this skips the network entirely on a visit; older
 // triggers a refresh (silent when the token is fresh, self-closing popup
 // re-auth otherwise).
@@ -97,17 +101,17 @@ function readCachedEvents() {
   try {
     const raw = localStorage.getItem(EVENTS_KEY);
     if (!raw) return null;
-    const { at, events } = JSON.parse(raw);
+    const { at, events, calendars } = JSON.parse(raw);
     if (!Array.isArray(events)) return null;
-    return { at: at || 0, events };
+    return { at: at || 0, events, calendars: Array.isArray(calendars) ? calendars : [] };
   } catch {
     return null;
   }
 }
 
-function storeCachedEvents(events) {
+function storeCachedEvents(calendars, events) {
   try {
-    localStorage.setItem(EVENTS_KEY, JSON.stringify({ at: Date.now(), events }));
+    localStorage.setItem(EVENTS_KEY, JSON.stringify({ at: Date.now(), events, calendars }));
   } catch {}
 }
 
@@ -157,8 +161,16 @@ async function loadLiveEvents(token) {
     try { localStorage.setItem(HINT_KEY, primary.id); } catch {}
   }
 
+  // Every calendar is fetched and each event tagged with its calendar id, so
+  // the picker can show/hide calendars locally without another network trip.
+  const calendars = (calList.items || []).map((c) => ({
+    id: c.id,
+    name: c.summaryOverride || c.summary || c.id,
+    color: c.backgroundColor || '#888',
+    primary: !!c.primary,
+  }));
   const events = [];
-  for (const cal of calList.items || []) {
+  for (const cal of calendars) {
     let pageToken = '';
     do {
       const url =
@@ -169,21 +181,96 @@ async function loadLiveEvents(token) {
       for (const ev of page.items || []) {
         if (ev.status === 'cancelled') continue;
         if (!ev.start || !ev.start.dateTime || !ev.end || !ev.end.dateTime) continue; // skip all-day
-        events.push({ start: ev.start.dateTime, end: ev.end.dateTime });
+        events.push({ start: ev.start.dateTime, end: ev.end.dateTime, cal: cal.id });
       }
       pageToken = page.nextPageToken || '';
     } while (pageToken);
   }
-  return events;
+  return { calendars, events };
 }
 
 async function syncWithToken(token) {
-  const events = await loadLiveEvents(token);
-  if (calendarSvg) drawEvents(calendarSvg, events);
-  storeCachedEvents(events);
+  const { calendars, events } = await loadLiveEvents(token);
+  setCalendarData(calendars, events);
+  storeCachedEvents(calendars, events);
   localStorage.setItem(CONNECTED_KEY, '1');
   return events.length;
 }
+
+// ---- Calendar picker. Hidden calendar ids persist in localStorage (hidden
+// rather than shown, so calendars added later appear by default). Toggling
+// only re-filters the already-synced events.
+
+let allCalendars = [];
+let allEvents = [];
+
+function readHiddenCalendars() {
+  try {
+    const ids = JSON.parse(localStorage.getItem(HIDDEN_KEY) || '[]');
+    return new Set(Array.isArray(ids) ? ids : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function storeHiddenCalendars(hidden) {
+  try {
+    localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden]));
+  } catch {}
+}
+
+function renderEvents() {
+  if (!calendarSvg) return;
+  const hidden = readHiddenCalendars();
+  // Events from caches predating the picker carry no calendar id; keep them.
+  drawEvents(calendarSvg, allEvents.filter((ev) => !ev.cal || !hidden.has(ev.cal)));
+}
+
+function renderCalendarList() {
+  const hidden = readHiddenCalendars();
+  calList.replaceChildren();
+  for (const cal of allCalendars) {
+    const label = document.createElement('label');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = !hidden.has(cal.id);
+    box.addEventListener('change', () => {
+      const h = readHiddenCalendars();
+      if (box.checked) h.delete(cal.id);
+      else h.add(cal.id);
+      storeHiddenCalendars(h);
+      renderEvents();
+    });
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = cal.color;
+    const name = document.createElement('span');
+    name.textContent = cal.name;
+    label.append(box, swatch, name);
+    calList.appendChild(label);
+  }
+}
+
+// Desktop has room to keep the list open beside the dial.
+const desktopQuery = window.matchMedia('(hover: hover) and (pointer: fine) and (min-width: 900px)');
+let pickerAutoOpened = false;
+
+function setCalendarData(calendars, events) {
+  if (calendars.length && !pickerAutoOpened && desktopQuery.matches) {
+    pickerAutoOpened = true;
+    calPicker.hidden = false;
+  }
+  allCalendars = calendars;
+  allEvents = events;
+  renderEvents();
+  renderCalendarList();
+  calToggle.hidden = calendars.length === 0;
+  if (calendars.length === 0) calPicker.hidden = true;
+}
+
+calToggle.addEventListener('click', () => {
+  calPicker.hidden = !calPicker.hidden;
+});
 
 function showConnectButton(label) {
   connectBtn.textContent = label || 'Connect Google Calendar';
@@ -310,6 +397,34 @@ const CROSS_SUPPRESS_MS = 500;
 const TOUCH_SUPPRESS_MS = 500;
 const SCALE_MIN = Math.pow(ZOOM_FACTOR, ZOOM_MIN_LEVEL);
 const SCALE_MAX = Math.pow(ZOOM_FACTOR, ZOOM_MAX_LEVEL);
+
+// Scale at which the whole dial fits the viewport with a small margin. The
+// wheel is 300vmin, so this sits just under 1/3; the zoom floor never stays
+// above it, so zooming all the way out always shows the full circle.
+const FIT_MARGIN = 0.94;
+
+function fitScale() {
+  return (Math.min(window.innerWidth, window.innerHeight) * FIT_MARGIN) / wheel.offsetWidth;
+}
+
+function scaleMin() {
+  return Math.min(SCALE_MIN, fitScale());
+}
+
+// Continuous zoom (mouse wheel, trackpad, keys). Pan scales with the zoom so
+// the same ring stays near the anchor, as with a pinch.
+function zoomTo(scale) {
+  const s = clamp(scale, scaleMin(), SCALE_MAX);
+  targetPan = clamp(targetPan * (s / targetScale), 0, panMaxFor(s));
+  targetScale = s;
+  zoomLevel = clamp(
+    Math.round(Math.log(s) / Math.log(ZOOM_FACTOR)),
+    ZOOM_MIN_LEVEL,
+    ZOOM_MAX_LEVEL
+  );
+  updateLod();
+  scheduleFrame();
+}
 
 function anchorToTopPx() {
   return window.innerHeight * 0.5;
@@ -532,12 +647,19 @@ function onMotion(event) {
 // The DeviceMotionEvent.requestPermission call MUST happen synchronously
 // inside the click handler on iOS Safari — any await before it drops the
 // user-gesture context and the prompt silently fails.
+// Mouse-and-keyboard machines skip motion entirely: there are no sensors to
+// read, and desktop Chromium's requestPermission answers "denied", which
+// would otherwise strand the user on the landing screen.
+const finePointerQuery = window.matchMedia('(hover: hover) and (pointer: fine)');
+
 function activate() {
   if (activateBtn.disabled) return;
   activateBtn.disabled = true;
   landingMsg.textContent = '';
 
+  const useMotion = !finePointerQuery.matches;
   const needsPrompt =
+    useMotion &&
     typeof DeviceMotionEvent !== 'undefined' &&
     typeof DeviceMotionEvent.requestPermission === 'function';
   const permissionPromise = needsPrompt
@@ -561,8 +683,10 @@ function activate() {
         activateBtn.disabled = false;
         return;
       }
-      motionWarmupUntil = performance.now() + WARMUP_MS;
-      window.addEventListener('devicemotion', onMotion);
+      if (useMotion) {
+        motionWarmupUntil = performance.now() + WARMUP_MS;
+        window.addEventListener('devicemotion', onMotion);
+      }
       document.body.classList.add('active');
       readout.hidden = false;
       // First run: offer the one-time calendar connect over the revealed dial.
@@ -594,6 +718,8 @@ function initPinch() {
 
 function onPointerDown(e) {
   if (!document.body.classList.contains('active')) return;
+  // Taps on the calendar picker are UI, not dial drags.
+  if (e.target.closest('#cal-toggle, #cal-picker')) return;
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pointers.size === 2) initPinch();
 }
@@ -616,7 +742,7 @@ function onPointerMove(e) {
   } else if (pointers.size === 2 && pinchStartDist > 0) {
     const [a, b] = [...pointers.values()];
     const ratio = Math.hypot(a.x - b.x, a.y - b.y) / pinchStartDist;
-    targetScale = clamp(pinchStartScale * ratio, SCALE_MIN, SCALE_MAX);
+    targetScale = clamp(pinchStartScale * ratio, scaleMin(), SCALE_MAX);
     // Keep the discrete zoom level in step so a later motion flick continues
     // from where the pinch left off.
     zoomLevel = clamp(
@@ -646,7 +772,73 @@ window.addEventListener('pointermove', onPointerMove);
 window.addEventListener('pointerup', onPointerEnd);
 window.addEventListener('pointercancel', onPointerEnd);
 
+// ---- Desktop: mouse wheel / trackpad zooms (a trackpad pinch arrives as a
+// wheel event with ctrlKey, which we also claim from browser page zoom).
+// Keys: +/- zoom, 0 fits the whole circle, arrows rotate and traverse rings.
+
+const WHEEL_ZOOM_RATE = 0.0015; // per wheel delta pixel
+const KEY_ROTATE_DEG = 360 / 366 * 7; // one week
+
+window.addEventListener(
+  'wheel',
+  (e) => {
+    if (!document.body.classList.contains('active')) return;
+    // Let the calendar list scroll normally.
+    if (e.target.closest('#cal-picker')) return;
+    e.preventDefault();
+    const px = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+    const rate = e.ctrlKey ? WHEEL_ZOOM_RATE * 6 : WHEEL_ZOOM_RATE;
+    zoomTo(targetScale * Math.exp(-px * rate));
+  },
+  { passive: false }
+);
+
+window.addEventListener('keydown', (e) => {
+  if (!document.body.classList.contains('active')) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target.closest('input, button')) return;
+  switch (e.key) {
+    case '+':
+    case '=':
+      zoomTo(targetScale * ZOOM_FACTOR);
+      break;
+    case '-':
+    case '_':
+      zoomTo(targetScale / ZOOM_FACTOR);
+      break;
+    case '0':
+      targetPan = 0;
+      zoomTo(fitScale());
+      break;
+    case 'ArrowLeft':
+      targetRotationDeg += KEY_ROTATE_DEG;
+      scheduleFrame();
+      break;
+    case 'ArrowRight':
+      targetRotationDeg -= KEY_ROTATE_DEG;
+      scheduleFrame();
+      break;
+    case 'ArrowUp':
+      targetPan = clamp(targetPan - ringStepPx(targetScale), 0, panMaxFor(targetScale));
+      scheduleFrame();
+      break;
+    case 'ArrowDown':
+      targetPan = clamp(targetPan + ringStepPx(targetScale), 0, panMaxFor(targetScale));
+      scheduleFrame();
+      break;
+    default:
+      return;
+  }
+  e.preventDefault();
+});
+
+// Keep the zoom floor and pan limit valid when the window is resized.
+window.addEventListener('resize', () => {
+  zoomTo(targetScale);
+});
+
 activateBtn.addEventListener('click', activate);
+if (finePointerQuery.matches) activateBtn.textContent = 'Open Calendar';
 
 // Apply the initial rotation immediately so today's day sits at the top even
 // in the landing state, behind the blur.

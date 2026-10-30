@@ -23,6 +23,10 @@
       <p id="landing-msg" role="status"></p>
     </div>
     <button id="connect" type="button" hidden>Connect Calendar</button>
+    <button id="cal-toggle" type="button" aria-controls="cal-picker" hidden>Calendars</button>
+    <div id="cal-picker" role="dialog" aria-label="Calendars to show" hidden>
+      <div id="cal-list"></div>
+    </div>
     <div id="readout" aria-hidden="true" hidden></div>
     <script src="https://accounts.google.com/gsi/client" async defer></script>
     <script type="module" src="./src/main.js"></script>
