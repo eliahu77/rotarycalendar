@@ -3,6 +3,9 @@ const landingMsg = document.getElementById('landing-msg');
 const wheel = document.getElementById('wheel');
 const readout = document.getElementById('readout');
 const connectBtn = document.getElementById('connect');
+const calToggle = document.getElementById('cal-toggle');
+const calPicker = document.getElementById('cal-picker');
+const calList = document.getElementById('cal-list');
 
 // OAuth client ID for live Google Calendar sync (client IDs are public
 // identifiers, safe to commit). Empty string disables the Connect button and
@@ -72,7 +75,7 @@ fetch('./rotary-calendar.svg')
     calendarSvg = svg;
     // Instant dial from the last sync; a background refresh may redraw it.
     const cache = readCachedEvents();
-    if (cache) drawEvents(svg, cache.events);
+    if (cache) setCalendarData(cache.calendars, cache.events);
   })
   .catch(() => {});
 
@@ -88,6 +91,7 @@ const CONNECTED_KEY = 'gcalConnected';
 const TOKEN_KEY = 'gcalToken';
 const HINT_KEY = 'gcalHint';
 const EVENTS_KEY = 'gcalEvents';
+const HIDDEN_KEY = 'gcalHidden';
 // Cache younger than this skips the network entirely on a visit; older
 // triggers a refresh (silent when the token is fresh, self-closing popup
 // re-auth otherwise).
@@ -97,17 +101,17 @@ function readCachedEvents() {
   try {
     const raw = localStorage.getItem(EVENTS_KEY);
     if (!raw) return null;
-    const { at, events } = JSON.parse(raw);
+    const { at, events, calendars } = JSON.parse(raw);
     if (!Array.isArray(events)) return null;
-    return { at: at || 0, events };
+    return { at: at || 0, events, calendars: Array.isArray(calendars) ? calendars : [] };
   } catch {
     return null;
   }
 }
 
-function storeCachedEvents(events) {
+function storeCachedEvents(calendars, events) {
   try {
-    localStorage.setItem(EVENTS_KEY, JSON.stringify({ at: Date.now(), events }));
+    localStorage.setItem(EVENTS_KEY, JSON.stringify({ at: Date.now(), events, calendars }));
   } catch {}
 }
 
@@ -157,8 +161,16 @@ async function loadLiveEvents(token) {
     try { localStorage.setItem(HINT_KEY, primary.id); } catch {}
   }
 
+  // Every calendar is fetched and each event tagged with its calendar id, so
+  // the picker can show/hide calendars locally without another network trip.
+  const calendars = (calList.items || []).map((c) => ({
+    id: c.id,
+    name: c.summaryOverride || c.summary || c.id,
+    color: c.backgroundColor || '#888',
+    primary: !!c.primary,
+  }));
   const events = [];
-  for (const cal of calList.items || []) {
+  for (const cal of calendars) {
     let pageToken = '';
     do {
       const url =
@@ -169,21 +181,88 @@ async function loadLiveEvents(token) {
       for (const ev of page.items || []) {
         if (ev.status === 'cancelled') continue;
         if (!ev.start || !ev.start.dateTime || !ev.end || !ev.end.dateTime) continue; // skip all-day
-        events.push({ start: ev.start.dateTime, end: ev.end.dateTime });
+        events.push({ start: ev.start.dateTime, end: ev.end.dateTime, cal: cal.id });
       }
       pageToken = page.nextPageToken || '';
     } while (pageToken);
   }
-  return events;
+  return { calendars, events };
 }
 
 async function syncWithToken(token) {
-  const events = await loadLiveEvents(token);
-  if (calendarSvg) drawEvents(calendarSvg, events);
-  storeCachedEvents(events);
+  const { calendars, events } = await loadLiveEvents(token);
+  setCalendarData(calendars, events);
+  storeCachedEvents(calendars, events);
   localStorage.setItem(CONNECTED_KEY, '1');
   return events.length;
 }
+
+// ---- Calendar picker. Hidden calendar ids persist in localStorage (hidden
+// rather than shown, so calendars added later appear by default). Toggling
+// only re-filters the already-synced events.
+
+let allCalendars = [];
+let allEvents = [];
+
+function readHiddenCalendars() {
+  try {
+    const ids = JSON.parse(localStorage.getItem(HIDDEN_KEY) || '[]');
+    return new Set(Array.isArray(ids) ? ids : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function storeHiddenCalendars(hidden) {
+  try {
+    localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden]));
+  } catch {}
+}
+
+function renderEvents() {
+  if (!calendarSvg) return;
+  const hidden = readHiddenCalendars();
+  // Events from caches predating the picker carry no calendar id; keep them.
+  drawEvents(calendarSvg, allEvents.filter((ev) => !ev.cal || !hidden.has(ev.cal)));
+}
+
+function renderCalendarList() {
+  const hidden = readHiddenCalendars();
+  calList.replaceChildren();
+  for (const cal of allCalendars) {
+    const label = document.createElement('label');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = !hidden.has(cal.id);
+    box.addEventListener('change', () => {
+      const h = readHiddenCalendars();
+      if (box.checked) h.delete(cal.id);
+      else h.add(cal.id);
+      storeHiddenCalendars(h);
+      renderEvents();
+    });
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = cal.color;
+    const name = document.createElement('span');
+    name.textContent = cal.name;
+    label.append(box, swatch, name);
+    calList.appendChild(label);
+  }
+}
+
+function setCalendarData(calendars, events) {
+  allCalendars = calendars;
+  allEvents = events;
+  renderEvents();
+  renderCalendarList();
+  calToggle.hidden = calendars.length === 0;
+  if (calendars.length === 0) calPicker.hidden = true;
+}
+
+calToggle.addEventListener('click', () => {
+  calPicker.hidden = !calPicker.hidden;
+});
 
 function showConnectButton(label) {
   connectBtn.textContent = label || 'Connect Google Calendar';
@@ -594,6 +673,8 @@ function initPinch() {
 
 function onPointerDown(e) {
   if (!document.body.classList.contains('active')) return;
+  // Taps on the calendar picker are UI, not dial drags.
+  if (e.target.closest('#cal-toggle, #cal-picker')) return;
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pointers.size === 2) initPinch();
 }
