@@ -251,7 +251,15 @@ function renderCalendarList() {
   }
 }
 
+// Desktop has room to keep the list open beside the dial.
+const desktopQuery = window.matchMedia('(hover: hover) and (pointer: fine) and (min-width: 900px)');
+let pickerAutoOpened = false;
+
 function setCalendarData(calendars, events) {
+  if (calendars.length && !pickerAutoOpened && desktopQuery.matches) {
+    pickerAutoOpened = true;
+    calPicker.hidden = false;
+  }
   allCalendars = calendars;
   allEvents = events;
   renderEvents();
@@ -389,6 +397,34 @@ const CROSS_SUPPRESS_MS = 500;
 const TOUCH_SUPPRESS_MS = 500;
 const SCALE_MIN = Math.pow(ZOOM_FACTOR, ZOOM_MIN_LEVEL);
 const SCALE_MAX = Math.pow(ZOOM_FACTOR, ZOOM_MAX_LEVEL);
+
+// Scale at which the whole dial fits the viewport with a small margin. The
+// wheel is 300vmin, so this sits just under 1/3; the zoom floor never stays
+// above it, so zooming all the way out always shows the full circle.
+const FIT_MARGIN = 0.94;
+
+function fitScale() {
+  return (Math.min(window.innerWidth, window.innerHeight) * FIT_MARGIN) / wheel.offsetWidth;
+}
+
+function scaleMin() {
+  return Math.min(SCALE_MIN, fitScale());
+}
+
+// Continuous zoom (mouse wheel, trackpad, keys). Pan scales with the zoom so
+// the same ring stays near the anchor, as with a pinch.
+function zoomTo(scale) {
+  const s = clamp(scale, scaleMin(), SCALE_MAX);
+  targetPan = clamp(targetPan * (s / targetScale), 0, panMaxFor(s));
+  targetScale = s;
+  zoomLevel = clamp(
+    Math.round(Math.log(s) / Math.log(ZOOM_FACTOR)),
+    ZOOM_MIN_LEVEL,
+    ZOOM_MAX_LEVEL
+  );
+  updateLod();
+  scheduleFrame();
+}
 
 function anchorToTopPx() {
   return window.innerHeight * 0.5;
@@ -611,12 +647,19 @@ function onMotion(event) {
 // The DeviceMotionEvent.requestPermission call MUST happen synchronously
 // inside the click handler on iOS Safari — any await before it drops the
 // user-gesture context and the prompt silently fails.
+// Mouse-and-keyboard machines skip motion entirely: there are no sensors to
+// read, and desktop Chromium's requestPermission answers "denied", which
+// would otherwise strand the user on the landing screen.
+const finePointerQuery = window.matchMedia('(hover: hover) and (pointer: fine)');
+
 function activate() {
   if (activateBtn.disabled) return;
   activateBtn.disabled = true;
   landingMsg.textContent = '';
 
+  const useMotion = !finePointerQuery.matches;
   const needsPrompt =
+    useMotion &&
     typeof DeviceMotionEvent !== 'undefined' &&
     typeof DeviceMotionEvent.requestPermission === 'function';
   const permissionPromise = needsPrompt
@@ -640,8 +683,10 @@ function activate() {
         activateBtn.disabled = false;
         return;
       }
-      motionWarmupUntil = performance.now() + WARMUP_MS;
-      window.addEventListener('devicemotion', onMotion);
+      if (useMotion) {
+        motionWarmupUntil = performance.now() + WARMUP_MS;
+        window.addEventListener('devicemotion', onMotion);
+      }
       document.body.classList.add('active');
       readout.hidden = false;
       // First run: offer the one-time calendar connect over the revealed dial.
@@ -697,7 +742,7 @@ function onPointerMove(e) {
   } else if (pointers.size === 2 && pinchStartDist > 0) {
     const [a, b] = [...pointers.values()];
     const ratio = Math.hypot(a.x - b.x, a.y - b.y) / pinchStartDist;
-    targetScale = clamp(pinchStartScale * ratio, SCALE_MIN, SCALE_MAX);
+    targetScale = clamp(pinchStartScale * ratio, scaleMin(), SCALE_MAX);
     // Keep the discrete zoom level in step so a later motion flick continues
     // from where the pinch left off.
     zoomLevel = clamp(
@@ -727,7 +772,73 @@ window.addEventListener('pointermove', onPointerMove);
 window.addEventListener('pointerup', onPointerEnd);
 window.addEventListener('pointercancel', onPointerEnd);
 
+// ---- Desktop: mouse wheel / trackpad zooms (a trackpad pinch arrives as a
+// wheel event with ctrlKey, which we also claim from browser page zoom).
+// Keys: +/- zoom, 0 fits the whole circle, arrows rotate and traverse rings.
+
+const WHEEL_ZOOM_RATE = 0.0015; // per wheel delta pixel
+const KEY_ROTATE_DEG = 360 / 366 * 7; // one week
+
+window.addEventListener(
+  'wheel',
+  (e) => {
+    if (!document.body.classList.contains('active')) return;
+    // Let the calendar list scroll normally.
+    if (e.target.closest('#cal-picker')) return;
+    e.preventDefault();
+    const px = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+    const rate = e.ctrlKey ? WHEEL_ZOOM_RATE * 6 : WHEEL_ZOOM_RATE;
+    zoomTo(targetScale * Math.exp(-px * rate));
+  },
+  { passive: false }
+);
+
+window.addEventListener('keydown', (e) => {
+  if (!document.body.classList.contains('active')) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target.closest('input, button')) return;
+  switch (e.key) {
+    case '+':
+    case '=':
+      zoomTo(targetScale * ZOOM_FACTOR);
+      break;
+    case '-':
+    case '_':
+      zoomTo(targetScale / ZOOM_FACTOR);
+      break;
+    case '0':
+      targetPan = 0;
+      zoomTo(fitScale());
+      break;
+    case 'ArrowLeft':
+      targetRotationDeg += KEY_ROTATE_DEG;
+      scheduleFrame();
+      break;
+    case 'ArrowRight':
+      targetRotationDeg -= KEY_ROTATE_DEG;
+      scheduleFrame();
+      break;
+    case 'ArrowUp':
+      targetPan = clamp(targetPan - ringStepPx(targetScale), 0, panMaxFor(targetScale));
+      scheduleFrame();
+      break;
+    case 'ArrowDown':
+      targetPan = clamp(targetPan + ringStepPx(targetScale), 0, panMaxFor(targetScale));
+      scheduleFrame();
+      break;
+    default:
+      return;
+  }
+  e.preventDefault();
+});
+
+// Keep the zoom floor and pan limit valid when the window is resized.
+window.addEventListener('resize', () => {
+  zoomTo(targetScale);
+});
+
 activateBtn.addEventListener('click', activate);
+if (finePointerQuery.matches) activateBtn.textContent = 'Open Calendar';
 
 // Apply the initial rotation immediately so today's day sits at the top even
 // in the landing state, behind the blur.
